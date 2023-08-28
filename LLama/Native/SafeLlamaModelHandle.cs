@@ -150,7 +150,7 @@ namespace LLama.Native
                     var tokens = new int[count];
                     fixed (int* tokensPtr = &tokens[0])
                     {
-                        count = NativeApi.llama_tokenize_with_model(this, bytesPtr, tokensPtr, count, add_bos);
+                        NativeApi.llama_tokenize_with_model(this, bytesPtr, tokensPtr, count, add_bos);
                         return tokens;
                     }
                 }

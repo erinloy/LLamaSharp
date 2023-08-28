@@ -1,7 +1,6 @@
 ﻿using LLama.Exceptions;
 using LLama.Native;
 using System;
-using System.Buffers;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -19,7 +18,7 @@ namespace LLama
     /// <summary>
     /// A llama_context, which holds all the context required to interact with a model
     /// </summary>
-    public class LLamaContext
+    public sealed class LLamaContext
         : IDisposable
     {
         private readonly ILLamaLogger? _logger;
@@ -68,7 +67,7 @@ namespace LLama
             Params = @params;
 
             _logger = logger;
-            _encoding = Encoding.GetEncoding(@params.Encoding);
+            _encoding = @params.Encoding;
 
             _logger?.Log(nameof(LLamaContext), $"Initializing LLama model with params: {this.Params}", ILLamaLogger.LogLevel.Info);
             _ctx = Utils.InitLLamaContextFromModelParams(Params);
@@ -79,7 +78,7 @@ namespace LLama
             Params = @params;
 
             _logger = logger;
-            _encoding = Encoding.GetEncoding(@params.Encoding);
+            _encoding = @params.Encoding;
             _ctx = nativeContext;
         }
 
@@ -98,7 +97,7 @@ namespace LLama
             Params = @params;
 
             _logger = logger;
-            _encoding = Encoding.GetEncoding(@params.Encoding);
+            _encoding = @params.Encoding;
 
             using var pin = @params.ToLlamaContextParams(out var lparams);
             _ctx = SafeLLamaContextHandle.Create(model.NativeHandle, lparams);
@@ -111,15 +110,8 @@ namespace LLama
         public LLamaContext Clone()
         {
             using var pin = Params.ToLlamaContextParams(out var lparams);
-
-            // Create a blank new context for the model
-            var ctx = new LLamaContext(SafeLLamaContextHandle.Create(NativeHandle.ModelHandle, lparams), Params);
-
-            // Copy across the state
-            using var state = GetState();
-            ctx.LoadState(state);
-
-            return ctx;
+            var clone = _ctx.Clone(lparams);
+            return  new LLamaContext(clone, Params);
         }
 
         /// <summary>
@@ -197,7 +189,7 @@ namespace LLama
         /// <returns></returns>
         public State GetState()
         {
-            var stateSize = NativeApi.llama_get_state_size(_ctx);
+            var stateSize = _ctx.GetStateSize();
 
             unsafe
             {
@@ -206,15 +198,17 @@ namespace LLama
                 try
                 {
                     // Copy the state data into "big memory", discover the actual size required
-                    var actualSize = NativeApi.llama_copy_state_data(_ctx, (byte*)bigMemory);
+                    var actualSize = _ctx.GetState(bigMemory, stateSize);
 
-                    // Allocate a smaller buffer
+                    // if big memory is nearly completely full (within 1MB) early exit and skip the extra copying
+                    if (actualSize >= stateSize - 1_000_000)
+                        return new State(bigMemory);
+
+                    // Allocate a smaller buffer which is exactly the right size
                     smallMemory = Marshal.AllocHGlobal((nint)actualSize);
 
                     // Copy into the smaller buffer and free the large one to save excess memory usage
                     Buffer.MemoryCopy(bigMemory.ToPointer(), smallMemory.ToPointer(), actualSize, actualSize);
-                    Marshal.FreeHGlobal(bigMemory);
-                    bigMemory = IntPtr.Zero;
 
                     return new State(smallMemory);
                 }
@@ -274,7 +268,7 @@ namespace LLama
         {
             unsafe
             {
-                NativeApi.llama_set_state_data(_ctx, (byte*)state.DangerousGetHandle().ToPointer());
+                _ctx.SetState((byte*)state.DangerousGetHandle().ToPointer());
             }
         }
 
@@ -361,36 +355,41 @@ namespace LLama
             int repeatLastTokensCount = 64, float repeatPenalty = 1.1f, float alphaFrequency = .0f, float alphaPresence = .0f, 
             bool penalizeNL = true)
         {
-            var n_vocab = _ctx.VocabCount;
             var logits = _ctx.GetLogits();
 
             // Apply params.logit_bias map
-            if(logitBias is not null)
+            if (logitBias is not null)
             {
                 foreach (var (key, value) in logitBias)
-                {
                     logits[key] += value;
-                }
             }
 
-            var candidates = new LLamaTokenData[n_vocab];
-            for (llama_token token_id = 0; token_id < n_vocab; token_id++)
-                candidates[token_id] = new LLamaTokenData(token_id, logits[token_id], 0.0f);
-            LLamaTokenDataArray candidates_p = new LLamaTokenDataArray(candidates);
+            // Save the newline logit value
+            var nl_token = NativeApi.llama_token_nl();
+            var nl_logit = logits[nl_token];
 
-            // Apply penalties
-            float nl_logit = logits[NativeApi.llama_token_nl()];
-            int lastTokensCount = lastTokens.Count();
-            var last_n_repeat = Math.Min(Math.Min(lastTokensCount, repeatLastTokensCount), ContextSize);
-            SamplingApi.llama_sample_repetition_penalty(_ctx, candidates_p,
-                lastTokens.Skip(lastTokensCount - last_n_repeat).ToArray(),
-                (ulong)last_n_repeat, repeatPenalty);
-            SamplingApi.llama_sample_frequency_and_presence_penalties(_ctx, candidates_p,
-                lastTokens.Skip(lastTokensCount - last_n_repeat).ToArray(),
-                (ulong)last_n_repeat, alphaFrequency, alphaPresence);
+            // Convert logits into token candidates
+            var candidates_p = LLamaTokenDataArray.Create(logits);
+
+            // Extract most recently returned tokens
+            var last_n_repeat = Math.Min(ContextSize, repeatLastTokensCount);
+            var last_n_array = lastTokens.TakeLast(last_n_repeat).ToArray();
+
+            // Apply penalties to candidates
+            SamplingApi.llama_sample_repetition_penalty(_ctx, candidates_p, last_n_array, repeatPenalty);
+            SamplingApi.llama_sample_frequency_and_presence_penalties(_ctx, candidates_p, last_n_array, alphaFrequency, alphaPresence);
+
+            // Restore newline token logit value if necessary
             if (!penalizeNL)
             {
-                logits[NativeApi.llama_token_nl()] = nl_logit;
+                var candidatesSpan = candidates_p.data.Span;
+                for (var i = 0; i < candidates_p.data.Length; i++)
+                {
+                    ref var item = ref candidatesSpan[i];
+                    if (item.id == nl_token)
+                        item.logit = nl_logit;
+                }
+                candidates_p.sorted = false;
             }
 
             return candidates_p;
@@ -426,7 +425,7 @@ namespace LLama
             // the list. Instead rent an array and copy the data into it. This avoids an allocation, but can't
             // avoid the copying.
 
-            var rented = ArrayPool<llama_token>.Shared.Rent(tokens.Count);
+            var rented = System.Buffers.ArrayPool<llama_token>.Shared.Rent(tokens.Count);
             try
             {
                 tokens.CopyTo(rented, 0);
@@ -434,7 +433,7 @@ namespace LLama
             }
             finally
             {
-                ArrayPool<llama_token>.Shared.Return(rented);
+                System.Buffers.ArrayPool<llama_token>.Shared.Return(rented);
             }
 #endif
         }
@@ -498,10 +497,8 @@ namespace LLama
         }
 
         /// <inheritdoc />
-        public virtual void Dispose()
+        public void Dispose()
         {
-            GC.SuppressFinalize(this);
-
             _ctx.Dispose();
         }
 

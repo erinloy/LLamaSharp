@@ -1,5 +1,4 @@
 ﻿using LLama.Common;
-using System.Text;
 
 namespace LLama.Examples.NewVersion
 {
@@ -11,7 +10,12 @@ namespace LLama.Examples.NewVersion
             var modelPath = Console.ReadLine();
             var prompt = File.ReadAllText("Assets/dan.txt").Trim();
 
-            var parameters = new ModelParams(modelPath, contextSize: 1024, seed: 1337, gpuLayerCount: 5);
+            var parameters = new ModelParams(modelPath)
+            {
+                ContextSize = 1024,
+                Seed = 1337,
+                GpuLayerCount = 5
+            };
             using var model = LLamaWeights.LoadFromFile(parameters);
             using var context = model.CreateContext(parameters);
             var executor = new InstructExecutor(context);

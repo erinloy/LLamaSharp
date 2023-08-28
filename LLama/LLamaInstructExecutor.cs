@@ -84,16 +84,16 @@ namespace LLama
         /// <inheritdoc />
         public override void SaveState(string filename)
         {
-            InstructExecutorState state = GetStateData() as InstructExecutorState;
-            using (FileStream fs = new FileStream(filename, FileMode.OpenOrCreate, FileAccess.Write))
+            var state = (InstructExecutorState)GetStateData();
+            using (var fs = new FileStream(filename, FileMode.OpenOrCreate, FileAccess.Write))
             {
-                JsonSerializer.Serialize<InstructExecutorState>(fs, state);
+                JsonSerializer.Serialize(fs, state);
             }
         }
         /// <inheritdoc />
         public override void LoadState(string filename)
         {
-            using (FileStream fs = new FileStream(filename, FileMode.Open, FileAccess.Read))
+            using (var fs = new FileStream(filename, FileMode.Open, FileAccess.Read))
             {
                 var state = JsonSerializer.Deserialize<InstructExecutorState>(fs);
                 LoadState(state);
@@ -108,10 +108,7 @@ namespace LLama
         /// <inheritdoc />
         protected override void PreprocessInputs(string text, InferStateArgs args)
         {
-            if(args.Antiprompts is null)
-            {
-                args.Antiprompts = new List<string>();
-            }
+            args.Antiprompts ??= new List<string>();
             args.Antiprompts.Add(_instructionPrefix);
             if (_is_prompt_run)
             {
@@ -160,7 +157,7 @@ namespace LLama
 
                 if (_pastTokensCount > 0 && args.WaitForInput)
                 {
-                    extraOutputs = new string[] { "\n> " };
+                    extraOutputs = new[] { "\n> " };
                     return true;
                 }
             }
